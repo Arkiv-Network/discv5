@@ -42,18 +42,22 @@ use enr::{CombinedKey, NodeId};
 use futures::prelude::*;
 use more_asserts::debug_unreachable;
 use parking_lot::RwLock;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use smallvec::SmallVec;
 use std::{
     collections::HashMap,
     convert::TryFrom,
     default::Default,
-    net::SocketAddr,
+    net::{SocketAddr, SocketAddrV4},
     pin::Pin,
     sync::{atomic::Ordering, Arc},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::timeout,
+};
 use tracing::{debug, error, trace, warn};
 
 mod active_requests;
@@ -780,24 +784,67 @@ impl Handler {
 
     /// Verifies a Node ENR to it's observed address. If it fails, any associated session is also
     /// considered failed. If it succeeds, we notify the application.
-    fn verify_enr(&self, enr: &Enr, node_address: &NodeAddress) -> bool {
+    async fn verify_enr(&self, enr: &Enr, node_address: &NodeAddress) -> bool {
         // If the ENR does not match the observed IP addresses, we consider the Session
         // failed.
-        enr.node_id() == node_address.node_id
-            && match node_address.socket_addr {
-                SocketAddr::V4(socket_addr) => enr.udp4_socket().map_or(true, |advertised_addr| {
-                    // If we have provided a cidr, treat the advertised address from a node
-                    // within that range as verified or check that the source matches the
-                    // advertised
-                    match self.allowed_cidr {
-                        Some(cidr) if cidr.contains(socket_addr.ip()) => true,
-                        _ => socket_addr == advertised_addr,
+        if enr.node_id() != node_address.node_id {
+            return false;
+        }
+        match node_address.socket_addr {
+            SocketAddr::V4(socket_addr) => {
+                if let Some(advertised_addr) = enr.udp4_socket() {
+                    if socket_addr == advertised_addr {
+                        debug!("Node {:?} has matching source address ({:?}) and advertised address ({:?})", node_address.node_id, socket_addr, advertised_addr);
+                        return true;
                     }
-                }),
-                SocketAddr::V6(socket_addr) => enr
-                    .udp6_socket()
-                    .map_or(true, |advertised_addr| socket_addr == advertised_addr),
+                    if let Some(cidr) = self.allowed_cidr {
+                        if cidr.contains(socket_addr.ip()) {
+                            debug!(
+                                "Node {:?} contained has source address ({:?}) within cidr ({:?}), probing validity",
+                                node_address.node_id, socket_addr, cidr
+                            );
+                            return self
+                                .probe_source_validity(advertised_addr, socket_addr)
+                                .await;
+                        }
+                    }
+                    false
+                } else {
+                    true
+                }
             }
+            SocketAddr::V6(socket_addr) => enr
+                .udp6_socket()
+                .map_or(true, |advertised_addr| socket_addr == advertised_addr),
+        }
+    }
+
+    async fn probe_source_validity(
+        &self,
+        advertised_addr: SocketAddrV4,
+        source_addr: SocketAddrV4,
+        node_id: NodeId,
+    ) -> bool {
+        let mut rng = StdRng::from_entropy();
+        let nonce: MessageNonce = rng.gen::<[u8; 12]>();
+
+        let packet = socket::OutboundPacket {
+            node_address: NodeAddress {
+                socket_addr: advertised_addr.into(),
+                node_id,
+            },
+            packet: Packet::new_message(self.node_id, nonce, Vec::new()),
+        };
+
+        // In this instance we are sending to the nodes advertise address, we expect to
+        // receive on the nodes source address
+        self.socket.send.send(packet).await;
+
+        // loop until timeout or reception of 
+        self.socket.recv.recv()
+
+        // TODO receive packet from source address
+        todo!()
     }
 
     async fn notify_unverifiable_enr(&self, enr: Enr, socket: SocketAddr, node_id: NodeId) {
@@ -846,7 +893,7 @@ impl Handler {
                     self.remove_expected_response(node_address.socket_addr);
                     // Receiving an AuthResponse must give us an up-to-date view of the node ENR.
                     // Verify the ENR is valid
-                    if self.verify_enr(&enr, &node_address) {
+                    if self.verify_enr(&enr, &node_address).await {
                         // Session is valid
                         // Notify the application
                         // The session established here are from WHOAREYOU packets that we sent.
@@ -1093,7 +1140,7 @@ impl Handler {
                                 ResponseBody::Nodes { mut nodes, .. } => {
                                     // Received the requested ENR
                                     if let Some(enr) = nodes.pop() {
-                                        if self.verify_enr(&enr, &node_address) {
+                                        if self.verify_enr(&enr, &node_address).await {
                                             // Notify the application
                                             // This can occur when we try to dial a node without an
                                             // ENR. In this case we have attempted to establish the
