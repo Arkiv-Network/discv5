@@ -790,12 +790,19 @@ impl Handler {
                         "verifying node {:?} with socket {:?} and advertise {:?}",
                         node_address.node_id, socket_addr, advertised_addr
                     );
+
                     // If we have provided a cidr, treat the advertised address from a node
                     // within that range as verified or check that the source matches the
                     // advertised
-                    match self.allowed_cidr {
-                        Some(cidr) if cidr.contains(socket_addr.ip()) => true,
-                        _ => socket_addr == advertised_addr,
+                    if socket_addr == advertised_addr {
+                        true
+                    } else {
+                        if let Some(cidr) = self.allowed_cidr {
+                            if cidr.contains(socket_addr.ip()) {
+                                return true;
+                            }
+                        }
+                        false
                     }
                 }),
                 SocketAddr::V6(socket_addr) => enr
