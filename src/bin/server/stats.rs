@@ -6,7 +6,7 @@ use tracing::info;
 
 /// Prints discv5 server stats on a regular cadence.
 pub fn run(discv5: Arc<Discv5>, break_time: Option<Duration>, stats: u64) {
-    let break_time = break_time.unwrap_or_else(|| Duration::from_secs(2));
+    let break_time = break_time.unwrap_or_else(|| Duration::from_secs(5));
     tokio::spawn(async move {
         let mut event_stream = discv5.event_stream().await.unwrap();
         let mut stats_interval = tokio::time::interval(break_time);

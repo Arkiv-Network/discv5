@@ -1,17 +1,21 @@
 use args::ServerArgs;
-use discv5::{ConfigBuilder, DefaultProtocolId, Discv5, Event, ListenConfig};
+use discv5::{ConfigBuilder, DefaultProtocolId, Discv5, ListenConfig};
 use std::error::Error;
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tracing::{error, info, warn};
+use tokio::{
+    select,
+    signal::unix::{signal, SignalKind},
+};
+use tracing::{info, warn};
 
 use crate::key;
 
 pub mod args;
+pub mod echo;
 pub mod enr;
+pub mod events;
 pub mod stats;
 
 pub async fn run(args: ServerArgs) -> Result<(), Box<dyn Error>> {
@@ -32,12 +36,10 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn Error>> {
         warn!("ENR is not printed as no IP:PORT was specified");
     }
 
-    let listen_config = ListenConfig::Ipv4 {
+    let mut config = ConfigBuilder::new(ListenConfig::Ipv4 {
         ip: args.listen_ipv4,
         port: args.listen_port,
-    };
-
-    let mut config = ConfigBuilder::new(listen_config);
+    });
 
     if let Some(cidr) = &args.cidr {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
@@ -83,86 +85,24 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn Error>> {
     let server_ref = Arc::new(discv5);
 
     stats::run(Arc::clone(&server_ref), None, 100);
+    events::run(Arc::clone(&server_ref));
+    echo::run(args.rpc_addr, args.rpc_port, enr_str);
 
-    tokio::spawn(async move {
-        listen_events(Arc::clone(&server_ref)).await;
-    });
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
 
-    let addr = format!("{}:{}", args.rpc_addr, args.rpc_port);
-    let listener = TcpListener::bind(&addr)
-        .await
-        .expect("could not bind ENR echo server");
-    info!(
-        "ENR echo server running on {:?}:{:?}",
-        args.rpc_addr, args.rpc_port
-    );
-    loop {
-        if let Ok((mut socket, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut buf = vec![0; 1024];
+    // Listen for shutdown signals
+    info!("Listening for termination request");
 
-                match socket.read(&mut buf).await {
-                    Ok(n) if n > 0 => {
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                                Content-Type: text/plain\r\n\
-                                Content-Length: {}\r\n\
-                                Connection: close\r\n\
-                                \r\n\
-                                {}",
-                            enr_str.len(),
-                            enr_str
-                        );
-
-                        if let Err(e) = socket.write_all(response.as_bytes()).await {
-                            error!("Failed to write to socket: {}", e);
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("Failed to read from socket: {}", e);
-                    }
-                }
-            });
+    // Wait for either SIGTERM or SIGINT
+    select! {
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM - initiating graceful shutdown");
+        }
+        _ = sigint.recv() => {
+            info!("Received SIGINT - initiating graceful shutdown");
         }
     }
-}
 
-async fn listen_events(server: Arc<Discv5>) {
-    let mut event_stream = server.event_stream().await.unwrap();
-    loop {
-        match event_stream.recv().await {
-            Some(Event::SocketUpdated(addr)) => {
-                info!("Nodes ENR socket address has been updated to: {:?}", addr);
-            }
-            Some(Event::Discovered(enr)) => {
-                info!("A peer has been discovered: {}", enr.node_id());
-            }
-            Some(Event::UnverifiableEnr { enr, .. }) => {
-                info!(
-                    "A peer has been added to the routing table with enr: {}",
-                    enr
-                );
-            }
-            Some(Event::NodeInserted { node_id, .. }) => {
-                info!(
-                    "A peer has been added to the routing table with node_id: {}",
-                    node_id
-                );
-            }
-            Some(Event::SessionEstablished(enr, addr)) => {
-                info!(
-                    "A session has been established with peer: {} at address: {}",
-                    enr, addr
-                );
-            }
-            Some(Event::TalkRequest(talk_request)) => {
-                info!(
-                    "A talk request has been received from peer: {}",
-                    talk_request.node_id()
-                );
-            }
-            _ => {}
-        }
-    }
+    Ok(())
 }
