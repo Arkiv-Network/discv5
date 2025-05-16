@@ -794,7 +794,10 @@ impl Handler {
                     // If we have provided a cidr, treat the advertised address from a node
                     // within that range as verified or check that the source matches the
                     // advertised
-                    if socket_addr == advertised_addr {
+                    if socket_addr.ip() == advertised_addr.ip() {
+                        if socket_addr.port() != advertised_addr.port() {
+                            warn!("socket {:?} and advertise {:?} ports are different, allowing verification",socket_addr, advertised_addr);
+                        }
                         true
                     } else {
                         if let Some(cidr) = self.allowed_cidr {
