@@ -54,7 +54,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 mod active_requests;
 mod crypto;
@@ -786,6 +786,10 @@ impl Handler {
         enr.node_id() == node_address.node_id
             && match node_address.socket_addr {
                 SocketAddr::V4(socket_addr) => enr.udp4_socket().map_or(true, |advertised_addr| {
+                    info!(
+                        "verifying node {:?} with socket {:?} and advertise {:?}",
+                        node_address.node_id, socket_addr, advertised_addr
+                    );
                     // If we have provided a cidr, treat the advertised address from a node
                     // within that range as verified or check that the source matches the
                     // advertised
